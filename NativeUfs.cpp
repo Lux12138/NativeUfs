@@ -1786,6 +1786,8 @@ static void mediaReportThread (void *, wait_result_t)
 
 extern "C" void nabu_log_boot_probe (void);
 extern "C" void nabu_log_periodic (void);
+/* Optional: present only when the NativeDwc3 archive is linked in. */
+extern "C" int native_dwc3_bringup (void) __attribute__((weak));
 extern "C" void nabu_panic_save_init (void *, unsigned long long);
 
 /* Panic-time log parking lot: 8 MiB above maxmem (4864 MiB), which the kernel never
@@ -2100,6 +2102,11 @@ bool NativeUfs::startRoot (IOService *provider)
     if (kernel_thread_start (nabuLogThread, nullptr, &logThread) == KERN_SUCCESS) {
       thread_deallocate (logThread);
     }
+  }
+  /* nabu: the IOService personality cannot win the single IOPlatformDevice nub
+   * (this driver scores higher), so run the DWC3 stages from here. */
+  if (native_dwc3_bringup != 0) {
+    (void)native_dwc3_bringup ();
   }
   return true;
 }
