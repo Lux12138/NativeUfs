@@ -1786,6 +1786,7 @@ static void mediaReportThread (void *, wait_result_t)
 
 extern "C" void nabu_log_boot_probe (void);
 extern "C" void nabu_log_periodic (void);
+extern "C" void nabu_log_puts (const char *s);
 /* Optional: present only when the NativeDwc3 archive is linked in. */
 extern "C" int native_dwc3_bringup (void) __attribute__((weak));
 extern "C" void nabu_panic_save_init (void *, unsigned long long);
@@ -2091,6 +2092,10 @@ bool NativeUfs::startRoot (IOService *provider)
    * ordinary process context. The panic path then only has to append, and a window
    * that cannot be opened or written is proven here instead of at panic time. */
   nabuMapPanicSave ();
+  /* nabu: run DWC3 before the probe write so its readings land in the window. */
+  nabu_log_puts ("ufs:dwc3-call
+");
+  (void)native_dwc3_bringup ();
   nabu_log_boot_probe ();
   /* Arm boot-recovery here, not in panic(). At panic time the flush already walks
    * the host lock path; touching a second window there stalled the board instead of
@@ -2102,11 +2107,6 @@ bool NativeUfs::startRoot (IOService *provider)
     if (kernel_thread_start (nabuLogThread, nullptr, &logThread) == KERN_SUCCESS) {
       thread_deallocate (logThread);
     }
-  }
-  /* nabu: the IOService personality cannot win the single IOPlatformDevice nub
-   * (this driver scores higher), so run the DWC3 stages from here. */
-  if (native_dwc3_bringup != 0) {
-    (void)native_dwc3_bringup ();
   }
   return true;
 }
