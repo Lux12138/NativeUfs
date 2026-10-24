@@ -283,9 +283,9 @@ static void zero32 (void *start, size_t length)
 // for inputs above 32 bits even with SCTLR.M=0. Storage DMA path only; this
 // is physical pass-through, not a page-table or Adreno 4 KiB qualification.
 static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, uint32_t *report,
-                              uint64_t dma, uint64_t bytes)
+                              uint64_t dma, uint64_t bytes, uintptr_t smmuOverride = 0)
 {
-  uintptr_t smmu = mapPhys (0x15000000ULL, 0xd0000, keep);
+  uintptr_t smmu = smmuOverride ? smmuOverride : mapPhys (0x15000000ULL, 0xd0000, keep);
   if (!smmu) {
     panic ("NATIVE_UFS smmu: map failed");
   }
@@ -2115,4 +2115,13 @@ void NativeUfs::stop (IOService *provider)
   fCmdDesc.reset ();
   fMap.reset ();
   IOService::stop (provider);
+}
+
+// nabu: let another driver (NativeDwc3) take the same bypass path for its stream.
+extern "C" int native_smmu_bypass (uint16_t stream, uint64_t dma, uint64_t bytes)
+{
+  OSSharedPtr<IOMemoryMap> keep;
+  uint32_t report[3] = { 0, 0, 0 };
+  smmuBypassStream (stream, keep, report, dma, bytes, gHost.smmu);
+  return 0;
 }
