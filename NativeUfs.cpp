@@ -2120,8 +2120,14 @@ void NativeUfs::stop (IOService *provider)
 // nabu: let another driver (NativeDwc3) take the same bypass path for its stream.
 extern "C" int native_smmu_bypass (uint16_t stream, uint64_t dma, uint64_t bytes)
 {
-  OSSharedPtr<IOMemoryMap> keep;
-  uint32_t report[3] = { 0, 0, 0 };
-  smmuBypassStream (stream, keep, report, dma, bytes, gHost.smmu);
+  // A second stream-level bypass disturbs the UFS bank bookkeeping. The SMMU's own
+  // unmatched-stream policy is enough: USFCFG=1 faults every unmatched stream (the
+  // state UFS found), so clear it and 0x140 reaches DRAM untranslated.
+  (void)stream; (void)dma; (void)bytes;
+  if (!gHost.smmu) { return -1; }
+  uintptr_t smmu = gHost.smmu;
+  uint32_t cr0 = read32 (smmu, 0x0);
+  write32 (smmu, 0x0, cr0 & ~(1u << 10));
+  __asm__ volatile ("dsb sy" ::: "memory");
   return 0;
 }
