@@ -2121,16 +2121,49 @@ void NativeUfs::stop (IOService *provider)
 // nabu: let another driver (NativeDwc3) take the same bypass path for its stream.
 extern "C" int native_smmu_bypass (uint16_t stream, uint64_t dma, uint64_t bytes)
 {
-  // A second stream-level bypass disturbs the UFS bank bookkeeping. The SMMU's own
-  // unmatched-stream policy is enough: USFCFG=1 faults every unmatched stream (the
-  // state UFS found), so clear it and 0x140 reaches DRAM untranslated.
-  (void)stream; (void)dma; (void)bytes;
+  // Give the caller its own stream-match entry and a context bank that is not in
+  // use by any other valid stream (UFS owns the last bank). USFCFG is read-only on
+  // this SMMU, so an unmatched stream can only be handled this way.
+  (void)dma; (void)bytes;
   if (!gHost.smmu) { return -1; }
   uintptr_t smmu = gHost.smmu;
-  uint32_t cr0 = read32 (smmu, 0x0);
-  nabu_log_hex ("smmu:cr0=", cr0);
-  write32 (smmu, 0x0, cr0 & ~(1u << 10));
-  nabu_log_hex ("smmu:cr0b=", read32 (smmu, 0x0));
-  __asm__ volatile ("dsb sy" ::: "memory");
-  return 0;
+  uint32_t idr0 = read32 (smmu, 0x20), idr1 = read32 (smmu, 0x24);
+  unsigned count = idr0 & 0xff, banks = idr1 & 0xff;
+  UfsSmmuPlan plan;
+  plan.pages = 1U << (((idr1 >> 28) & 7) + 1);
+  if (count > 128) count = 128;
+  if (banks < 3 || !count) { return -2; }
+
+  unsigned slot = 0xffffffffU;
+  for (unsigned i = 0; i < count; ++i) {
+    if (!(read32 (smmu, 0x800 + 4 * i) & 0x80000000U)) { slot = i; break; }
+  }
+  if (slot == 0xffffffffU) { return -3; }
+
+  unsigned bank = 0xffffffffU;
+  for (unsigned b = banks - 2; b > 0; --b) {
+    bool used = false;
+    for (unsigned i = 0; i < count && !used; ++i) {
+      uint32_t smr = read32 (smmu, 0x800 + 4 * i);
+      if (!(smr & 0x80000000U)) { continue; }
+      uint32_t s2cr = read32 (smmu, 0xc00 + 4 * i);
+      if (((s2cr >> 16) & 3) == 0 && (s2cr & 0xff) == b) { used = true; }
+    }
+    if (!used) { bank = b; break; }
+  }
+  if (bank == 0xffffffffU) { return -4; }
+
+  plan.slot = slot;
+  plan.bank = bank;
+  const char *failure = configureUfsSmmu (plan, stream,
+    [smmu](unsigned off) { return read32 (smmu, off); },
+    [smmu](unsigned off, uint32_t v) {
+      write32 (smmu, off, v);
+      __asm__ volatile ("dsb sy" ::: "memory");
+    });
+  nabu_log_hex ("smmu2:slot=", slot);
+  nabu_log_hex ("smmu2:bank=", bank);
+  nabu_log_hex ("smmu2:smr=", read32 (smmu, 0x800 + 4 * slot));
+  nabu_log_hex ("smmu2:s2cr=", read32 (smmu, 0xc00 + 4 * slot));
+  return failure ? -5 : 0;
 }
