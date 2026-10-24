@@ -11,6 +11,8 @@ struct RootWindow {
 
 struct RootLayout {
   uint64_t userdataFirst, userdataLast;   // 4096-byte LBAs on LUN 0
+  uint64_t miscFirst;                     // misc (bootloader_message) first LBA, 0 when absent
+  bool miscFound;
   uint64_t imageBytes;                    // size of the flashed root image from the manifest (0 when none)
   uint64_t gptEntriesLba;                 // GPT facts recorded for the persistent store's before/after comparison
   uint32_t gptHeaderCrc, gptEntriesCrc, gptEntryCount;
@@ -104,6 +106,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     return false;
   }
   static const char wanted[] = "userdata";
+  static const char wantedMisc[] = "misc";
   bool found = false;
   for (uint32_t index = 0; index < count; index++) {
     const uint8_t *entry = gScratch + index * 128;
@@ -135,6 +138,17 @@ static bool findRootLayout (RootLayout *layout, const char **why)
       layout->userdataFirst = le64 (entry + 32);
       layout->userdataLast = le64 (entry + 40);
       found = true;
+    }
+    bool matchMisc = true;
+    for (unsigned c = 0; c < sizeof (wantedMisc); c++) {
+      if (entry[56 + 2 * c] != static_cast<uint8_t> (wantedMisc[c]) || entry[57 + 2 * c] != 0) {
+        matchMisc = false;
+        break;
+      }
+    }
+    if (matchMisc) {
+      layout->miscFirst = entryFirst;
+      layout->miscFound = true;
     }
   }
   if (!found || layout->userdataLast < layout->userdataFirst) {

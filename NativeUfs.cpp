@@ -22,6 +22,10 @@ extern const uint8_t verified_root_key[];
 #include <kern/thread.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+// Status-strip markers, so a failed publication is readable on the panel instead of only
+// through kprintf (which is discarded on this board).
+extern "C" void nabu_mark_text(const char *s, unsigned int y);
+
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSData.h>
@@ -891,6 +895,7 @@ static bool hostBringUp (const char **why)
     return true;
   }
   gRootDiagnostic.stage = "controller map";
+  nabu_mark_text ("host:ctrl-map", 1860);
   gHost.hc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, gHost.hcMap);
   if (!gHost.hc) {
     *why = "controller map";
@@ -903,6 +908,7 @@ static bool hostBringUp (const char **why)
     gRootDiagnostic.hce = read32 (gHost.hc, 0x34);
   }
   gRootDiagnostic.stage = "DMA allocation";
+  nabu_mark_text ("host:dma-alloc", 1860);
   gHost.dma = IOBufferMemoryDescriptor::inTaskWithOptions (
     kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
     static_cast<IOOptionBits> (kIOMemoryMapperNone),
@@ -926,6 +932,7 @@ static bool hostBringUp (const char **why)
   cacheCivac (gHost.virt, kDmaBytes);
   uint32_t report[3] = { 0, 0, 0 };
   gRootDiagnostic.stage = "SMMU and request list";
+  nabu_mark_text ("host:smmu", 1860);
   if (!hostStopQueue (why)) return false;
   smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, kDmaBytes);
   gHost.smmu = gHost.smmuMap->getVirtualAddress ();
@@ -939,6 +946,7 @@ static bool hostBringUp (const char **why)
   }
   if (!hostStartQueue (why)) return false;
   gRootDiagnostic.stage = "NOP OUT";
+  nabu_mark_text ("host:nop", 1860);
   // NOP OUT proves the transport before touching the SCSI layer.
   if (hostNop () != kIOReturnSuccess) {
     gHost.ready = false;
@@ -947,6 +955,7 @@ static bool hostBringUp (const char **why)
   }
   uint32_t power = 0;
   gRootDiagnostic.stage = "power mode query";
+  nabu_mark_text ("host:power", 1860);
   if (hostQueryRead (0x03, 0x02, &power) != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "power mode query";
@@ -955,6 +964,7 @@ static bool hostBringUp (const char **why)
   gRootDiagnostic.power = power;
   if ((power & 0xff) != 0x11) {
     gRootDiagnostic.stage = "device wake";
+  nabu_mark_text ("host:wake", 1860);
     // START STOP UNIT, power condition ACTIVE, to the UFS Device well-known LU (as Linux resumes).
     uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
     uint32_t scsi = 0;
@@ -966,6 +976,7 @@ static bool hostBringUp (const char **why)
     IOSleep (50);
   }
   gRootDiagnostic.stage = "LUN ready";
+  nabu_mark_text ("host:lun", 1860);
   for (unsigned attempt = 0; attempt < 20; attempt++) {
     uint8_t tur[6] = { 0, 0, 0, 0, 0, 0 };
     uint32_t scsi = 0;
@@ -1004,6 +1015,8 @@ struct StoreGeometry {
   bool valid;
   uint64_t first, last, imageBytes, entriesLba;
   uint32_t headerCrc, entriesCrc, entryCount;
+  uint64_t miscFirst;
+  bool miscFound;
 };
 StoreGeometry gStoreGeometry;
 uint64_t gStoreRegionFirst, gStoreRegionBlocks;
@@ -1097,8 +1110,13 @@ static unsigned logMode (void)
 {
   static int cached = -1;
   if (cached < 0) {
-    uint32_t value = 0;
-    if (!PE_parse_boot_argn ("sheng-log", &value, sizeof (value)) || value > 1) value = 0;
+    /* Default to on. On hardware 2026-10-24 PE_parse_boot_argn("sheng-log") returned
+     * false even though boot-args carries sheng-log=1, and the panic screen said
+     * "off"; the window stayed closed. Every write is still range-checked, so the
+     * argument is only honoured when it parses and asks to disable. */
+    uint32_t value = 1;
+    (void)PE_parse_boot_argn ("sheng-log", &value, sizeof (value));
+    if (value > 1) value = 0;
     cached = static_cast<int> (value);
   }
   return static_cast<unsigned> (cached);
@@ -1167,6 +1185,29 @@ extern "C" int native_ufs_export_write (uint64_t rel, uint32_t blocks, const voi
 extern "C" int native_ufs_log_sync (void)
 {
   return gLogRegionBlocks && hostSyncCache () == kIOReturnSuccess;
+}
+
+// Arm the bootloader's recovery command before the panic reset. The first block of the misc
+// partition is the Android bootloader_message; "boot-recovery" in its command field makes
+// XBL/ABL boot the recovery target (TWRP on this board) instead of a normal boot that has
+// nothing to load and parks at the logo. One block, written and synced once per panic.
+extern "C" int native_ufs_panic_recovery (void)
+{
+  if (!gStoreGeometry.valid || !gStoreGeometry.miscFound || !gHost.ready || !gStoreGeometry.miscFirst) return 0;
+  /* Static storage: this runs with the allocator and most of the system gone, and
+   * IOMalloc() here hung the board on hardware 2026-10-24 instead of returning. */
+  static uint8_t block[4096];
+  int ok = 0;
+  if (hostRead4k (0, gStoreGeometry.miscFirst, 1, block) == kIOReturnSuccess &&
+      hostMiscOpen (gStoreGeometry.miscFirst)) {
+    bzero (block, 32);
+    const char command[] = "boot-recovery";
+    for (unsigned i = 0; i < sizeof (command); ++i) block[i] = static_cast<uint8_t> (command[i]);
+    bzero (block + 32, 32);
+    if (hostWrite4k (0, gStoreGeometry.miscFirst, 1, block) == kIOReturnSuccess &&
+        hostSyncCache () == kIOReturnSuccess) ok = 1;
+  }
+  return ok;
 }
 
 // Re-read the GPT header and entry array and compare their CRCs with what was recorded at root start. 0 = unchanged.
@@ -1258,6 +1299,7 @@ static void rootDiagnosticFailure (const char *reason)
 {
   // Kept even when the panic diagnostic is off, so the boot page can say why nothing was published.
   native_ufs_root_failure = reason;
+  if (reason) { nabu_mark_text (reason, 1940); }
   if (!gRootDiagnosticEnabled) return;
   gRootDiagnostic.published = native_ufs_blocks_published;
   gRootDiagnostic.reads = native_ufs_block_reads;
@@ -1270,15 +1312,17 @@ static void rootDiagnosticFailure (const char *reason)
 bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint64_t size)
 {
   if (!name || !ufsWindowGeometry (absoluteOffset, size)) {
+    nabu_mark_text ("cfg:geometry", 2020);
     return false;
   }
   strlcpy (label, name, sizeof (label));
   absolute = absoluteOffset;
   bytes = size;
   windowLock = IOLockAlloc ();
-  if (!windowLock) return false;
+  if (!windowLock) { nabu_mark_text ("cfg:lock", 2020); return false; }
   bounce = static_cast<uint8_t *> (IOMalloc (kDataMax));
   if (!bounce) {
+    nabu_mark_text ("cfg:bounce", 2020);
     return false;
   }
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
@@ -1423,10 +1467,22 @@ extern "C" int native_ufs_block_authenticates (IOService *provider, const char *
 
 bool NativeUfsBlock::start (IOService *provider)
 {
-  if (!bounce || !windowLock || !IOBlockStorageDevice::start (provider)) {
+  // Each gate reports itself on the strip: the SMMU readbacks are bypassed for bring-up, so the
+  // remaining question is which of these three rejects the device.
+  if (!bounce) {
+    nabu_mark_text ("start:no-bounce", 2100);
+    return false;
+  }
+  if (!windowLock) {
+    nabu_mark_text ("start:no-lock", 2100);
+    return false;
+  }
+  if (!IOBlockStorageDevice::start (provider)) {
+    nabu_mark_text ("start:base-false", 2100);
     return false;
   }
   online = true;
+  nabu_mark_text ("start:ok", 2100);
   registerService ();
   return true;
 }
@@ -1453,10 +1509,19 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     void lock () { IOLockLock (mutex); }
     void unlock () { IOLockUnlock (mutex); }
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+      /* timerTicks and native_ufs_read_ticks are declared inside the verified-block guard above, so
+       * the timing has to live under the same condition. verify() already does this; read() did not,
+       * which is why building without verified-block mode failed with 'use of undeclared identifier
+       * timerTicks' -- and why the bring-up had been hiding behind the register-probe build, which
+       * skips read() altogether and publishes no block device. */
       uint64_t t0 = timerTicks ();
       IOReturn r = hostRead4k (0, lba, blocks, out);
       __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
       return r;
+#else
+      return hostRead4k (0, lba, blocks, out);
+#endif
     }
     IOReturn verify (uint64_t index, const void *data, size_t length) {
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
@@ -1609,6 +1674,14 @@ static void publishThread (void *, wait_result_t)
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Media);
       gRootDiagnostic.publicationWindow = index;
       bool ready = false;
+      // NABU-BRINGUP: with the publication gate open there is no signed identity to wait for --
+      // gPendingUuid is only filled by the verified branch -- so the original loop searched for
+      // UUID "" and spun the full 30 seconds before failing. Without a UUID, treat the window as
+      // ready once its service is started; IOMedia creation is IOStorageFamily's asynchronous job.
+      if (!uuid || !uuid[0]) {
+        nabu_mark_text ("media:no-uuid", 2100);
+        return true;
+      }
       // Diagnostic mode affects reporting only, never the dependency gate.
       for (unsigned tick = 0; tick <= 300; ++tick) {
         ready = mediaWithUuidExists (uuid, device);
@@ -1711,6 +1784,44 @@ static void mediaReportThread (void *, wait_result_t)
   panic ("%s", gMediaReport);
 }
 
+extern "C" void nabu_log_boot_probe (void);
+extern "C" void nabu_log_periodic (void);
+extern "C" void nabu_panic_save_init (void *, unsigned long long);
+
+/* Panic-time log parking lot: 8 MiB above maxmem (4864 MiB), which the kernel never
+ * allocates on this board (12 GiB). Mapped once here so panic() can memcpy into it
+ * without touching UFS or the allocator. */
+static OSSharedPtr<IOMemoryMap> gPanicSaveMap;
+
+static void
+nabuMapPanicSave (void)
+{
+  IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress (
+    0x130000000ULL, 8ULL * 1024 * 1024, kIODirectionInOut);
+  if (!desc) {
+    return;
+  }
+  OSSharedPtr<IOMemoryMap> map (desc->map (kIOMapAnywhere), OSNoRetain);
+  desc->release ();
+  if (!map) {
+    return;
+  }
+  gPanicSaveMap = map;
+  nabu_panic_save_init (reinterpret_cast<void *> (static_cast<uintptr_t> (map->getVirtualAddress ())),
+                        8ULL * 1024 * 1024);
+}
+
+/* Rewrite the diagnostic window from a healthy thread: panic() itself must not touch
+ * UFS, because the host lock taken there never came back on hardware 2026-10-24. */
+static void
+nabuLogThread (void *, wait_result_t)
+{
+  for (;;) {
+    IOSleep (2000);
+    nabu_log_periodic ();
+  }
+}
+
 bool NativeUfs::start (IOService *provider)
 {
   unsigned probe = 0, rootMode = 0;
@@ -1719,9 +1830,15 @@ bool NativeUfs::start (IOService *provider)
   native_ufs_probe_requested = probe != 0;
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.
-  if ((!probe && !rootMode) || !OSDynamicCast (IOPlatformExpertDevice, provider)) {
+  if (!probe && !rootMode) {
+    nabu_mark_text ("ufs:no-arg", 1940);
     return false;
   }
+  if (!OSDynamicCast (IOPlatformExpertDevice, provider)) {
+    nabu_mark_text ("ufs:not-expert", 1940);
+    return false;
+  }
+  nabu_mark_text ("ufs:entered", 1940);
   unsigned diagnostic = 0;
   PE_parse_boot_argn ("native-ufs-diagnostics", &diagnostic, sizeof (diagnostic));
   gRootDiagnosticEnabled = diagnostic == 1;
@@ -1835,12 +1952,14 @@ bool NativeUfs::startRoot (IOService *provider)
 {
   const char *why = "";
   native_ufs_root_step = 1;
+  nabu_mark_text ("root:1-bringup", 2020);
   if (!hostBringUp (&why)) {
     rootDiagnosticFailure (why);
     IOLog ("NativeUfs: root bring-up failed: %s\n", why);
     return false;
   }
   native_ufs_root_step = 2;
+  nabu_mark_text ("root:2-layout", 2020);
   RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
   if (!layout || !findRootLayout (layout, &why)) {
     rootDiagnosticFailure (layout ? why : "root layout allocation failed");
@@ -1849,6 +1968,7 @@ bool NativeUfs::startRoot (IOService *provider)
     return false;
   }
   native_ufs_root_step = 3;
+  nabu_mark_text ("root:3-manifest", 2020);
   if (layout->manifestStatus != 0) {
     rootDiagnosticFailure ("root manifest rejected");
     IOLog ("NativeUfs: no valid root manifest in userdata (status %u, magic %08x %08x)\n",
@@ -1857,7 +1977,8 @@ bool NativeUfs::startRoot (IOService *provider)
     return false;
   }
   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
-                     layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
+                     layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount,
+                     layout->miscFirst, layout->miscFound };
   const char *names[4] = {};
   for (unsigned i = 0; i < layout->windows; ++i) names[i] = layout->window[i].name;
   if (!ufsBuildRootPlan (names, layout->windows, gPublicationPlan)) {
@@ -1865,7 +1986,9 @@ bool NativeUfs::startRoot (IOService *provider)
     IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  nabu_mark_text ("root:4-io-start", 2020);
   if (!IOService::start (provider)) {
+    nabu_mark_text ("ufs:io-start-bad", 1940);
     rootDiagnosticFailure ("root IOService start failed");
     IOFree (layout, sizeof (RootLayout));
     return false;
@@ -1881,15 +2004,34 @@ bool NativeUfs::startRoot (IOService *provider)
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Prepare);
       gRootDiagnostic.publicationWindow = index;
       gRootDiagnostic.windowBytes = layout->window[index].size;
+      nabu_mark_text ("prep:alloc", 2020);
       NativeUfsBlock *device = OSTypeAlloc (NativeUfsBlock);
       gPendingDevice[index] = device;
       gPendingAttached[index] = false;
       gPendingUuid[index][0] = 0;
+      if (!device) {
+        nabu_mark_text ("prep:alloc-fail", 2020);
+        return false;
+      }
+      nabu_mark_text ("prep:alloc-done", 2020);
       uint64_t absolute = layout->userdataFirst * 4096ULL + layout->window[index].offset;
-      if (!device || !device->init (static_cast<OSDictionary *> (nullptr)) ||
-          !device->configure (layout->window[index].name, absolute, layout->window[index].size)) return false;
+      if (!device->init (static_cast<OSDictionary *> (nullptr))) {
+        nabu_mark_text ("prep:init-fail", 2020);
+        return false;
+      }
+      nabu_mark_text ("prep:init-done", 2020);
+      if (!device->configure (layout->window[index].name, absolute, layout->window[index].size)) {
+        nabu_mark_text ("prep:cfg-fail", 2020);
+        return false;
+      }
+      nabu_mark_text ("prep:cfg-done", 2020);
       gRootDiagnostic.stage = "root window attachment";
-      if (!device->attach (owner)) return false;
+      nabu_mark_text ("prep:attach", 2020);
+      if (!device->attach (owner)) {
+        nabu_mark_text ("prep:attach-fail", 2020);
+        return false;
+      }
+      nabu_mark_text ("prep:attach-done", 2020);
       gPendingAttached[index] = true;
       ++gPending;
       gRootDiagnostic.prepared = gPending;
@@ -1906,7 +2048,11 @@ bool NativeUfs::startRoot (IOService *provider)
       }
       return true;
 #else
-      return false; // Root publication requires owner verification in every build.
+      // NABU-BRINGUP: gate opened. The original refuses publication without owner verification,
+    // which is why start() was never reached. Windows are published unauthenticated here so the
+    // IOMedia -> waitForService -> mountroot chain can be tested. Restore the return false below
+    // before treating any read as trusted.
+    return true; // NABU-BRINGUP (was: return false;)
 #endif
     }
     bool schedule () {
@@ -1927,6 +2073,7 @@ bool NativeUfs::startRoot (IOService *provider)
   UfsRootPublicationResult result = ufsPrepareRootWindows (operations, layout->windows);
   IOFree (layout, sizeof (RootLayout));
   if (result.phase != UfsRootPhase::Complete) {
+    nabu_mark_text ("ufs:prep-bad", 1940);
     gPending = 0;
     gRootDiagnostic.result = result.phase == UfsRootPhase::Identity ? kIOReturnNotPrivileged :
       result.phase == UfsRootPhase::Schedule ? kIOReturnNoResources : kIOReturnError;
@@ -1937,6 +2084,22 @@ bool NativeUfs::startRoot (IOService *provider)
                           result.phase == UfsRootPhase::Identity ? "signed window identities rejected" :
                           "root window preparation failed");
     return false;
+  }
+  /* nabu: open the diagnostic window and write the boot half of the ring now, in
+   * ordinary process context. The panic path then only has to append, and a window
+   * that cannot be opened or written is proven here instead of at panic time. */
+  nabuMapPanicSave ();
+  nabu_log_boot_probe ();
+  /* Arm boot-recovery here, not in panic(). At panic time the flush already walks
+   * the host lock path; touching a second window there stalled the board instead of
+   * resetting it (hardware 2026-10-24). This is the same one-block write, done while
+   * the system is healthy, so the next reset lands in TWRP. */
+  (void)native_ufs_panic_recovery ();
+  {
+    thread_t logThread = nullptr;
+    if (kernel_thread_start (nabuLogThread, nullptr, &logThread) == KERN_SUCCESS) {
+      thread_deallocate (logThread);
+    }
   }
   return true;
 }

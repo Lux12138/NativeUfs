@@ -10,7 +10,12 @@ struct HardwareTransferPort {
     return *reinterpret_cast<volatile uint32_t *> (gHost.virt + 8) & 0xff;
   }
   bool expired () { return mach_absolute_time () >= deadline; }
-  void delay () { IODelay (2); }
+  void delay () {
+    // NABU-BRINGUP: do not use IODelay here. It spins on mach_absolute_time(), which does not
+    // appear to advance this early on this board, so the first call never returns and neither
+    // the deadline check nor the poll ceiling above ever executes. A fixed CPU spin always ends.
+    for (unsigned spin = 0; spin < 200; ++spin) { __asm__ volatile ("yield" ::: "memory"); }
+  }
 };
 
 static void putBe32 (uint8_t *at, uint32_t value)
@@ -260,8 +265,8 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
 // The only place this driver writes. At most two windows of 4096-byte LBAs on LUN 0 (the Data store and the diagnostic log),
 // each opened once by its integration after it has proved that the window lies inside the userdata partition and clear of the
 // root image; every write is checked against them again here, so nothing outside them can be written even if a caller is wrong.
-static bool gStoreOpen = false, gLogOpen = false;
-static uint64_t gStoreFirst = 0, gStoreBlocks = 0, gLogFirst = 0, gLogBlocks = 0;
+static bool gStoreOpen = false, gLogOpen = false, gMiscOpen = false;
+static uint64_t gStoreFirst = 0, gStoreBlocks = 0, gLogFirst = 0, gLogBlocks = 0, gMiscFirst = 0;
 
 static bool hostLogOpen (uint64_t first, uint64_t blocks)
 {
@@ -276,7 +281,20 @@ static bool hostLogOpen (uint64_t first, uint64_t blocks)
 static bool hostInWindow (uint64_t lba, uint32_t blocks)
 {
   if (gStoreOpen && lba >= gStoreFirst && lba - gStoreFirst < gStoreBlocks && blocks <= gStoreBlocks - (lba - gStoreFirst)) return true;
-  return gLogOpen && lba >= gLogFirst && lba - gLogFirst < gLogBlocks && blocks <= gLogBlocks - (lba - gLogFirst);
+  if (gLogOpen && lba >= gLogFirst && lba - gLogFirst < gLogBlocks && blocks <= gLogBlocks - (lba - gLogFirst)) return true;
+  /* nabu: the one misc block, written at panic time to arm boot-recovery. */
+  return gMiscOpen && lba == gMiscFirst && blocks == 1;
+}
+
+// One-block write window on the misc partition (the Android bootloader_message block).
+static bool hostMiscOpen (uint64_t first)
+{
+  if (gMiscOpen || !first || first > 0xfffffffeULL) return false;
+  if (gStoreOpen && first < gStoreFirst + gStoreBlocks && gStoreFirst < first + 1) return false;
+  if (gLogOpen && first < gLogFirst + gLogBlocks && gLogFirst < first + 1) return false;
+  gMiscFirst = first;
+  gMiscOpen = true;
+  return true;
 }
 
 static bool hostStoreOpen (uint64_t first, uint64_t blocks)
@@ -309,7 +327,7 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
 // SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns.
 static IOReturn hostSyncCache (void)
 {
-  if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
+  if (!gHost.ready || (!gStoreOpen && !gLogOpen && !gMiscOpen)) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
   uint8_t cdb[10] = { 0x35 };
   uint32_t scsi = 0;
