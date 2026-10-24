@@ -24,6 +24,7 @@ extern const uint8_t verified_root_key[];
 #include <IOKit/IOBufferMemoryDescriptor.h>
 // Status-strip markers, so a failed publication is readable on the panel instead of only
 // through kprintf (which is discarded on this board).
+extern "C" void nabu_log_hex(const char *label, unsigned long long value);
 extern "C" void nabu_mark_text(const char *s, unsigned int y);
 
 #include <IOKit/IOMemoryDescriptor.h>
@@ -2127,7 +2128,9 @@ extern "C" int native_smmu_bypass (uint16_t stream, uint64_t dma, uint64_t bytes
   if (!gHost.smmu) { return -1; }
   uintptr_t smmu = gHost.smmu;
   uint32_t cr0 = read32 (smmu, 0x0);
+  nabu_log_hex ("smmu:cr0=", cr0);
   write32 (smmu, 0x0, cr0 & ~(1u << 10));
+  nabu_log_hex ("smmu:cr0b=", read32 (smmu, 0x0));
   __asm__ volatile ("dsb sy" ::: "memory");
   return 0;
 }
