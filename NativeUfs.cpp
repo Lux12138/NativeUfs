@@ -2093,8 +2093,7 @@ bool NativeUfs::startRoot (IOService *provider)
    * that cannot be opened or written is proven here instead of at panic time. */
   nabuMapPanicSave ();
   /* nabu: run DWC3 before the probe write so its readings land in the window. */
-  nabu_log_puts ("ufs:dwc3-call
-");
+  nabu_log_puts ("ufs:dwc3-call\n");
   (void)native_dwc3_bringup ();
   nabu_log_boot_probe ();
   /* Arm boot-recovery here, not in panic(). At panic time the flush already walks
