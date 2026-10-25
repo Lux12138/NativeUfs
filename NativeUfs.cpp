@@ -1819,14 +1819,47 @@ nabuMapPanicSave (void)
  * UFS, because the host lock taken there never came back on hardware 2026-10-24. */
 extern "C" volatile unsigned int gDwc3Window;
 extern "C" volatile unsigned int gDwc3Ticks;
+extern "C" volatile unsigned int gDwc3Events;
+extern "C" volatile unsigned int gDwc3Setups;
+extern "C" volatile unsigned int gFlushRequested;
+extern "C" int nabu_log_flush_nowait (void);
 extern "C" void nabu_psci_reset (void);
 
+/* Publishes the ring from its own thread. It wakes on the USB event counter, so a
+ * snapshot lands within ~100 ms of the last event the core reported; at one per
+ * 2 s the line that matters -- the last one before a wedge -- is usually lost.
+ * The 2 s floor keeps a snapshot coming while the host is silent. */
 static void
 nabuLogThread (void *, wait_result_t)
 {
+  unsigned int lastEvents = 0;
+  unsigned int quiet = 0;
   for (;;) {
-    IOSleep (2000);
-    nabu_log_periodic ();
+    IOSleep (100);
+    /* Never touch UFS while the DWC3 bring-up owns the controller. Runs 72-74 came
+     * back with the previous boot's window byte for byte: this thread's first flush
+     * raced the bring-up, never returned, and left nabu_log_busy set for good, so
+     * even the panic flush was muted. The bring-up writes nothing to UFS itself, so
+     * this thread is the only writer and it waits for gFlushRequested. */
+    if (gDwc3Window) {
+      /* The bring-up no longer writes UFS from its own thread, so this one is
+       * the only writer and can publish the ring while the window is open.
+       * Runs 72-74 lost their window because a voluntary flush raced the
+       * bring-up's own disk writes; the control path now only appends to the
+       * ring, which is what makes a periodic flush safe here. */
+      if (gFlushRequested || gDwc3Events != lastEvents || ++quiet >= 20) {
+        gFlushRequested = 0;
+        lastEvents = gDwc3Events;
+        quiet = 0;
+        nabu_log_periodic ();
+      }
+      continue;
+    }
+    if (gDwc3Events != lastEvents || ++quiet >= 20) {
+      lastEvents = gDwc3Events;
+      quiet = 0;
+      nabu_log_periodic ();
+    }
   }
 }
 
@@ -1839,22 +1872,38 @@ nabuLogThread (void *, wait_result_t)
 static void
 nabuWatchdogThread (void *, wait_result_t)
 {
-  unsigned int lastTicks = 0;
-  unsigned int stalled = 0;
+  unsigned int lastEvents = 0;
+  unsigned int quiet = 0;
   for (;;) {
-    IOSleep (2000);
+    IOSleep (1000);
     if (!gDwc3Window) {
-      stalled = 0;
-      lastTicks = gDwc3Ticks;
+      quiet = 0;
+      lastEvents = gDwc3Events;
       continue;
     }
-    if (gDwc3Ticks == lastTicks) {
-      if (++stalled >= 20) {
-        nabu_psci_reset ();
+    if (gDwc3Events != lastEvents) {
+      quiet = 0;
+      lastEvents = gDwc3Events;
+      continue;
+    }
+    /* Poll-loop iterations are not progress: the loop keeps spinning after the
+     * controller stops answering, so a counter that only ever moved with the loop
+     * would hold a hung board for minutes waiting on the XNU watchdog. Events are
+     * the only thing here that means the core did something. Six seconds is just
+     * past the ~5 s the host waits for an answer; before the first SETUP the
+     * deadline is longer because the host may still be sampling the port. */
+    ++quiet;
+    const unsigned int limit = gDwc3Setups ? 10u : 20u;
+    if (quiet >= limit) {
+      /* Last chance to publish the ring -- the DRAM copy does not survive
+       * the reset. The write happens on the log thread, so a UFS hang here
+       * cannot swallow the reset the way it did in run 65; the wait is a
+       * fixed count, never a poll on hardware. */
+      gFlushRequested = 1;
+      for (unsigned int i = 0; i < 30; ++i) {
+        IOSleep (100);
       }
-    } else {
-      stalled = 0;
-      lastTicks = gDwc3Ticks;
+      nabu_psci_reset ();
     }
   }
 }
@@ -2140,15 +2189,21 @@ bool NativeUfs::startRoot (IOService *provider)
       thread_deallocate (watchdog);
     }
   }
+  /* Arm boot-recovery before the bring-up, not after it. It used to sit one line
+   * past native_dwc3_bringup(), and the run that finally wedged inside the
+   * bring-up reset before reaching it: the board came back to the Mi logo with
+   * nothing to boot, because ABL had no recovery command to obey. Panic time is
+   * too late for a second window, so the one-block write happens here while the
+   * system is healthy, and every reset from this point lands in TWRP. */
+  (void)native_ufs_panic_recovery ();
+  /* Baseline before the bring-up. Run 76 proved even this one must not sync: the
+   * sync never returned, nabu_log_busy stayed set, and the window froze on this
+   * snapshot while every later flush was silently dropped. */
+  nabu_log_periodic ();
   /* nabu: run DWC3 before the probe write so its readings land in the window. */
   nabu_log_puts ("ufs:dwc3-call\n");
   (void)native_dwc3_bringup ();
   nabu_log_boot_probe ();
-  /* Arm boot-recovery here, not in panic(). At panic time the flush already walks
-   * the host lock path; touching a second window there stalled the board instead of
-   * resetting it (hardware 2026-10-24). This is the same one-block write, done while
-   * the system is healthy, so the next reset lands in TWRP. */
-  (void)native_ufs_panic_recovery ();
   return true;
 }
 
