@@ -1817,12 +1817,45 @@ nabuMapPanicSave (void)
 
 /* Rewrite the diagnostic window from a healthy thread: panic() itself must not touch
  * UFS, because the host lock taken there never came back on hardware 2026-10-24. */
+extern "C" volatile unsigned int gDwc3Window;
+extern "C" volatile unsigned int gDwc3Ticks;
+extern "C" void nabu_psci_reset (void);
+
 static void
 nabuLogThread (void *, wait_result_t)
 {
   for (;;) {
     IOSleep (2000);
     nabu_log_periodic ();
+  }
+}
+
+/* Separate from the writer on purpose. Run 65 hung the board for good: the USB
+ * bring-up ran 20 s, the writer flushed UFS ten times during it, and nothing came
+ * back -- not even this reset. The writer had wedged inside UFS, and with the
+ * watchdog in the same thread the one mechanism meant to recover a hung board
+ * hung with it. This thread only reads two counters and sends an SMC, so UFS or
+ * controller MMIO cannot take it down. */
+static void
+nabuWatchdogThread (void *, wait_result_t)
+{
+  unsigned int lastTicks = 0;
+  unsigned int stalled = 0;
+  for (;;) {
+    IOSleep (2000);
+    if (!gDwc3Window) {
+      stalled = 0;
+      lastTicks = gDwc3Ticks;
+      continue;
+    }
+    if (gDwc3Ticks == lastTicks) {
+      if (++stalled >= 20) {
+        nabu_psci_reset ();
+      }
+    } else {
+      stalled = 0;
+      lastTicks = gDwc3Ticks;
+    }
   }
 }
 
@@ -2093,6 +2126,20 @@ bool NativeUfs::startRoot (IOService *provider)
    * ordinary process context. The panic path then only has to append, and a window
    * that cannot be opened or written is proven here instead of at panic time. */
   nabuMapPanicSave ();
+  /* nabu: start the periodic writer before the USB bring-up. That call can wedge or
+   * panic inside the controller, and the writer used to be started after it -- so a
+   * hanging bring-up also killed the log, and a dead log looked exactly like a dead
+   * CPU in runs 61-63. */
+  {
+    thread_t logThread = nullptr;
+    if (kernel_thread_start (nabuLogThread, nullptr, &logThread) == KERN_SUCCESS) {
+      thread_deallocate (logThread);
+    }
+    thread_t watchdog = nullptr;
+    if (kernel_thread_start (nabuWatchdogThread, nullptr, &watchdog) == KERN_SUCCESS) {
+      thread_deallocate (watchdog);
+    }
+  }
   /* nabu: run DWC3 before the probe write so its readings land in the window. */
   nabu_log_puts ("ufs:dwc3-call\n");
   (void)native_dwc3_bringup ();
@@ -2102,12 +2149,6 @@ bool NativeUfs::startRoot (IOService *provider)
    * resetting it (hardware 2026-10-24). This is the same one-block write, done while
    * the system is healthy, so the next reset lands in TWRP. */
   (void)native_ufs_panic_recovery ();
-  {
-    thread_t logThread = nullptr;
-    if (kernel_thread_start (nabuLogThread, nullptr, &logThread) == KERN_SUCCESS) {
-      thread_deallocate (logThread);
-    }
-  }
   return true;
 }
 
