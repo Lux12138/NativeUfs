@@ -1822,8 +1822,20 @@ extern "C" volatile unsigned int gDwc3Ticks;
 extern "C" volatile unsigned int gDwc3Events;
 extern "C" volatile unsigned int gDwc3Setups;
 extern "C" volatile unsigned int gFlushRequested;
-extern "C" int nabu_log_flush_nowait (void);
 extern "C" void nabu_psci_reset (void);
+
+/* The bring-up must never wait on the disk: run 65 wedged inside the flush it made
+ * from its own thread. It only raises the flag this driver's log thread polls, so
+ * the write still happens on the one thread that owns UFS. */
+extern "C" int
+nabu_log_flush_nowait (void)
+{
+  if (!gDwc3Window) {
+    return 0;
+  }
+  gFlushRequested = 1;
+  return 1;
+}
 
 /* Publishes the ring from its own thread. It wakes on the USB event counter, so a
  * snapshot lands within ~100 ms of the last event the core reported; at one per
