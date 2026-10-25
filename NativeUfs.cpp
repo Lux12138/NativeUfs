@@ -2203,6 +2203,7 @@ bool NativeUfs::startRoot (IOService *provider)
    * ordinary process context. The panic path then only has to append, and a window
    * that cannot be opened or written is proven here instead of at panic time. */
   nabuMapPanicSave ();
+  nabu_log_puts ("ufs:start\n");
   /* nabu: start the periodic writer before the USB bring-up. That call can wedge or
    * panic inside the controller, and the writer used to be started after it -- so a
    * hanging bring-up also killed the log, and a dead log looked exactly like a dead
@@ -2217,21 +2218,17 @@ bool NativeUfs::startRoot (IOService *provider)
       thread_deallocate (watchdog);
     }
   }
-  /* Arm boot-recovery before the bring-up, not after it. It used to sit one line
-   * past native_dwc3_bringup(), and the run that finally wedged inside the
-   * bring-up reset before reaching it: the board came back to the Mi logo with
-   * nothing to boot, because ABL had no recovery command to obey. Panic time is
-   * too late for a second window, so the one-block write happens here while the
-   * system is healthy, and every reset from this point lands in TWRP. */
-  (void)native_ufs_panic_recovery ();
-  /* Baseline before the bring-up. Run 76 proved even this one must not sync: the
-   * sync never returned, nabu_log_busy stayed set, and the window froze on this
-   * snapshot while every later flush was silently dropped. */
-  nabu_log_periodic ();
+  nabu_log_puts ("ufs:threads\n");
   /* nabu: run DWC3 before the probe write so its readings land in the window. */
   nabu_log_puts ("ufs:dwc3-call\n");
   (void)native_dwc3_bringup ();
+  nabu_log_puts ("ufs:bringup-done\n");
   nabu_log_boot_probe ();
+  /* Arm boot-recovery here, not in panic(). At panic time the flush already walks
+   * the host lock path; touching a second window there stalled the board instead of
+   * resetting it (hardware 2026-10-24). This is the same one-block write, done while
+   * the system is healthy, so the next reset lands in TWRP. */
+  (void)native_ufs_panic_recovery ();
   return true;
 }
 
