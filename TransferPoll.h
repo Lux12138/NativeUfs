@@ -23,6 +23,10 @@ static UfsTransferEnd pollUfsTransfer(Port &port, UfsTransferPoll &state)
       if (state.ocs != 15) return UfsTransferEnd::Completed;
     }
     if (port.expired()) return UfsTransferEnd::Timeout;
+    // NABU-BRINGUP: iteration ceiling as well as the clock. On this board mach_absolute_time() does
+    // not appear to advance this early, so expired() never fires and the loop spins forever -- the
+    // caller's timeout never returns a verdict. Count alone terminates regardless of the clock.
+    if (state.polls >= 1000000U) return UfsTransferEnd::Timeout;
     port.delay();
   }
 }

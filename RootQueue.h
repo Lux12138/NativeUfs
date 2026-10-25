@@ -4,10 +4,13 @@ static bool hostWaitRegister (unsigned offset, uint32_t mask, uint32_t value)
 {
   uint64_t deadline;
   clock_interval_to_deadline (100, kMillisecondScale, &deadline);
-  do {
+  // NABU-BRINGUP: bounded by iterations as well as by the clock, because mach_absolute_time() does
+  // not appear to advance at this point in boot -- a clock-only loop would never end.
+  for (unsigned round = 0; round < 20000; ++round) {
     if ((read32 (gHost.hc, offset) & mask) == value) return true;
-    IODelay (10);
-  } while (mach_absolute_time () < deadline);
+    // NABU-BRINGUP: same reason as the port delay -- IODelay spins on a clock that is not advancing.
+    for (unsigned spin = 0; spin < 400; ++spin) { __asm__ volatile ("yield" ::: "memory"); }
+  }
   return false;
 }
 
