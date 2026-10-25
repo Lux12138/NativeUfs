@@ -1027,6 +1027,20 @@ constexpr uint64_t kLogReserveBlocks = 8192;
 // part of the log's write window, so the store ends below both.
 constexpr uint64_t kExportBlocks = 65536;
 uint64_t gLogRegionFirst, gLogRegionBlocks;
+// The reserve at the end of userdata that the Data store stays clear of: the log and its export region sit inside it (sheng-log=1), the rest
+// is unused. sheng-log-reserve=<MiB>, default 1024; 0 gives all the room to Data and is only accepted with the log off. The store's place
+// depends on it, so an image keeps one value for its whole life (a different value moves the store: the old one is read as blank).
+constexpr uint32_t kDefaultReserveMiB = 1024;
+static uint64_t reserveBlocks (void)
+{
+  static int64_t cached = -1;
+  if (cached < 0) {
+    uint32_t mib = kDefaultReserveMiB;
+    if (!PE_parse_boot_argn ("sheng-log-reserve", &mib, sizeof (mib)) || mib > 16384) mib = kDefaultReserveMiB;
+    cached = static_cast<int64_t> (mib) * 256;   // 4096-byte blocks
+  }
+  return static_cast<uint64_t> (cached);
+}
 
 static unsigned storeMode (void)
 {
@@ -1053,12 +1067,13 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
   else {
     uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
     uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
-    if (!blocks || blocks > partition / 4) reason = "size";
-    else if (partition - blocks - kLogReserveBlocks - kExportBlocks < imageBlocks + 1024) reason = "overlaps the root image";
+    const uint64_t reserve = reserveBlocks ();
+    if (!blocks || reserve >= partition || blocks > partition - reserve) reason = "size";
+    else if (partition - blocks - reserve < imageBlocks + 1024) reason = "overlaps the root image";
     else {
-      // The last kLogReserveBlocks of the partition belong to the diagnostic log and the kExportBlocks below them to its export region;
-      // the store ends just below both.
-      uint64_t first = gStoreGeometry.last + 1 - kLogReserveBlocks - kExportBlocks - blocks;
+      // The reserve at the end of the partition belongs to the diagnostic log (its last 32 MiB, with the export region below them);
+      // the store ends just below it.
+      uint64_t first = gStoreGeometry.last + 1 - reserve - blocks;
       if (storeMode () == 2 && !hostStoreOpen (first, blocks)) reason = "window refused";
       else {
         gStoreRegionFirst = first;
@@ -1091,7 +1106,8 @@ extern "C" int native_ufs_store_write (uint64_t rel, uint32_t blocks, const void
       blocks > gStoreRegionBlocks - rel) return 0;
   while (blocks) {
     uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
-    if (hostWrite4k (0, gStoreRegionFirst + rel, chunk, src) != kIOReturnSuccess) return 0;
+    // Forced unit access: the block is on the medium when the command completes, so the overlay needs no cache flush.
+    if (hostWrite4k (0, gStoreRegionFirst + rel, chunk, src, true) != kIOReturnSuccess) return 0;
     src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
     rel += chunk;
     blocks -= chunk;
@@ -1134,8 +1150,8 @@ extern "C" int native_ufs_log_open (uint64_t *firstLba, uint64_t *blocks, const 
   else {
     uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
     uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
-    if (partition < (kLogReserveBlocks + kExportBlocks) * 4 || partition - kLogReserveBlocks - kExportBlocks < imageBlocks + 1024)
-      reason = "overlaps the root image";
+    if (reserveBlocks () < kLogReserveBlocks + kExportBlocks) reason = "reserve too small for the log";
+    else if (partition - reserveBlocks () < imageBlocks + 1024) reason = "overlaps the root image";
     else {
       uint64_t first = gStoreGeometry.last + 1 - kLogReserveBlocks;
       // One write window covers the export region and the log: [first - kExportBlocks, first + kLogReserveBlocks).
